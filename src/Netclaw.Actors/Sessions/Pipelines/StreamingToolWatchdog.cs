@@ -7,29 +7,37 @@ using Netclaw.Tools;
 
 namespace Netclaw.Actors.Sessions.Pipelines;
 
-/// <summary>
-/// Inactivity budget for one tool call: <see cref="FirstItem"/> bounds the wait
-/// for the first <see cref="ToolCallUpdate"/>, <see cref="InterItem"/> the gap
-/// between later items. <see cref="Flat"/> uses one value for both. A
-/// non-positive budget disables the watchdog.
-/// </summary>
-internal readonly record struct ToolWatchdogBudget(TimeSpan FirstItem, TimeSpan InterItem)
+internal enum ToolWatchdogResetMode
 {
-    public static ToolWatchdogBudget Flat(TimeSpan budget) => new(budget, budget);
+    ResetOnItem,
+    WallClock
+}
+
+/// <summary>
+/// Budget for one tool-call stream. Opaque tools use <see cref="WallClock"/> so
+/// output cannot keep them alive forever. (Self-monitoring tools are not watched by
+/// the parent at all — they own their liveness and are drained without a budget;
+/// see <c>SessionToolExecutionPipeline</c>.)
+/// </summary>
+internal readonly record struct ToolWatchdogBudget(TimeSpan FirstItem, TimeSpan InterItem, ToolWatchdogResetMode ResetMode)
+{
+    public ToolWatchdogBudget(TimeSpan firstItem, TimeSpan interItem)
+        : this(firstItem, interItem, ToolWatchdogResetMode.ResetOnItem)
+    {
+    }
+
+    public static ToolWatchdogBudget Flat(TimeSpan budget) => new(budget, budget, ToolWatchdogResetMode.ResetOnItem);
+    public static ToolWatchdogBudget WallClock(TimeSpan budget) => new(budget, budget, ToolWatchdogResetMode.WallClock);
 }
 
 /// <summary>
 /// Consumes one tool call's <see cref="ToolCallUpdate"/> stream under a per-call
-/// inactivity watchdog and returns the terminal completion result.
+/// watchdog and returns the terminal completion result.
 ///
-/// This is the only liveness control for a tool call — there is no batch-level
-/// watchdog, so a healthy parallel call cannot extend (or mask) a stalled
-/// sibling. A periodic timer polls a last-activity timestamp rather than being
-/// reset on each item: resetting a timer cannot recall an already-elapsed
-/// callback, so a reset racing the callback could cancel a still-live call —
-/// polling has no such race. The timer comes from the supplied
-/// <see cref="TimeProvider"/> so it can be virtualized in tests. A tool whose
-/// iterator ignores the enumerator's cancellation token cannot be force-stopped.
+/// There is no batch-level watchdog, so sibling calls are monitored
+/// independently. The timer comes from the supplied <see cref="TimeProvider"/>
+/// so it can be virtualized in tests. A tool whose iterator ignores the
+/// enumerator's cancellation token cannot be force-stopped.
 /// </summary>
 internal static class StreamingToolWatchdog
 {
@@ -46,7 +54,8 @@ internal static class StreamingToolWatchdog
         using var watchdogCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         // Shared with the timer callback. Both are long fields (atomic reads/
-        // writes); the consumer writes them on each item, the callback reads them.
+        // writes); the consumer updates them according to the selected reset mode,
+        // the callback reads them.
         var lastActivity = timeProvider.GetTimestamp();
         var budgetTicks = budget.FirstItem.Ticks;
 
@@ -68,7 +77,6 @@ internal static class StreamingToolWatchdog
             PollInterval,
             PollInterval);
 
-        string? result = null;
         var enumerator = stream.GetAsyncEnumerator(watchdogCts.Token);
         try
         {
@@ -82,27 +90,19 @@ internal static class StreamingToolWatchdog
                 catch (OperationCanceledException)
                     when (watchdogCts.IsCancellationRequested && !ct.IsCancellationRequested)
                 {
-                    // Watchdog fired (not caller cancellation): report a timeout.
-                    var stalled = TimeSpan.FromTicks(Volatile.Read(ref budgetTicks));
-                    throw new TimeoutException(
-                        $"Tool '{toolName}' produced no activity for {stalled.TotalSeconds:F0}s "
-                        + "and was stopped. It may be stuck — please try again, or simplify the request.");
+                    throw BuildTimeoutException(toolName, budget.ResetMode, TimeSpan.FromTicks(Volatile.Read(ref budgetTicks)));
                 }
 
                 if (!hasNext)
                     break;
 
-                // Any item is liveness; later items are held to the tighter budget.
-                Volatile.Write(ref budgetTicks, budget.InterItem.Ticks);
-                Volatile.Write(ref lastActivity, timeProvider.GetTimestamp());
+                ApplyItemReset(budget, timeProvider, ref lastActivity, ref budgetTicks);
 
                 switch (enumerator.Current)
                 {
                     case ToolCompletedUpdate completed:
                         return completed.Result;
                     case ToolActivityUpdate activity:
-                        if (activity.SuspendsInactivityWatchdog)
-                            Volatile.Write(ref budgetTicks, TimeSpan.Zero.Ticks);
                         onActivity?.Invoke(activity);
                         break;
                 }
@@ -115,7 +115,37 @@ internal static class StreamingToolWatchdog
 
         // A stream that ends with no completion item violates the tool-call
         // contract — fail loudly rather than synthesizing a result.
-        return result ?? throw new InvalidOperationException(
+        throw new InvalidOperationException(
             $"Tool '{toolName}' stream ended without a completion item.");
+    }
+
+    private static void ApplyItemReset(
+        ToolWatchdogBudget budget,
+        TimeProvider timeProvider,
+        ref long lastActivity,
+        ref long budgetTicks)
+    {
+        switch (budget.ResetMode)
+        {
+            case ToolWatchdogResetMode.ResetOnItem:
+                Volatile.Write(ref budgetTicks, budget.InterItem.Ticks);
+                Volatile.Write(ref lastActivity, timeProvider.GetTimestamp());
+                break;
+            case ToolWatchdogResetMode.WallClock:
+                break;
+        }
+    }
+
+    private static TimeoutException BuildTimeoutException(string toolName, ToolWatchdogResetMode mode, TimeSpan timeout)
+    {
+        var message = mode switch
+        {
+            ToolWatchdogResetMode.WallClock =>
+                $"Tool '{toolName}' exceeded execution budget of {timeout.TotalSeconds:F0}s and was stopped.",
+            _ =>
+                $"Tool '{toolName}' produced no activity for {timeout.TotalSeconds:F0}s and was stopped. It may be stuck — please try again, or simplify the request."
+        };
+
+        return new TimeoutException(message);
     }
 }

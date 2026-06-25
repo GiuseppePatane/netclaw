@@ -16,6 +16,8 @@ using Netclaw.Actors.Reminders;
 using Netclaw.Actors.Tests.Hosting;
 using Netclaw.Configuration;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Actors.Tests.Reminders;
 
@@ -401,7 +403,7 @@ public class ReminderManagerActorTests : TestKit
         var defaults = new EffectivePolicyDefaults(
             DeploymentPosture.Team, TrustAudience.Team, ShellExecutionMode.Off, false);
 
-        Sys.ActorOf(
+        var manager = Sys.ActorOf(
             Props.Create(() => new ReminderManagerActor(
                 pipeline,
                 defaults,
@@ -412,13 +414,23 @@ public class ReminderManagerActorTests : TestKit
                 sink)),
             "legacy-reminder-alert-manager");
 
-        await AwaitAssertAsync(() =>
-        {
-            Assert.Contains(sink.Alerts, alert =>
-                alert.Category == AlertType.ReminderSchemaDropped
-                && alert.Summary.Contains(reminderId, StringComparison.Ordinal));
-            return Task.CompletedTask;
-        }, duration: TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        // The legacy-schema alert is emitted synchronously inside PreStart, and
+        // an actor processes mailbox messages only AFTER PreStart completes — so
+        // a successful health reply is a deterministic signal that PreStart (and
+        // the emit) has run. Awaiting that signal replaces a wall-clock
+        // AwaitAssertAsync(5s) poll that flaked under heavy parallel CI load: when
+        // the shared ThreadPool is saturated, PreStart can be scheduled later than
+        // a fixed 5s budget, leaving the sink empty when the poll gives up. The
+        // generous Ask timeout absorbs that scheduling latency without polling —
+        // it returns as soon as the actor is ready.
+        await manager.Ask<ReminderHealthResponse>(
+            GetReminderHealthQuery.Instance,
+            TimeSpan.FromSeconds(30),
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains(sink.Alerts, alert =>
+            alert.Category == AlertType.ReminderSchemaDropped
+            && alert.Summary.Contains(reminderId, StringComparison.Ordinal));
     }
 
     /// <summary>

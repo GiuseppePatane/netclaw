@@ -14,6 +14,8 @@ using Netclaw.Configuration;
 using Netclaw.Tests.Utilities;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
+using static Netclaw.Actors.Jobs.BackgroundJobProtocol;
 
 namespace Netclaw.Actors.Tests.Jobs;
 
@@ -23,6 +25,7 @@ namespace Netclaw.Actors.Tests.Jobs;
 /// delivery via gateway resolution. Follows the same anchor pattern as
 /// <see cref="Reminders.ReminderManagerActorTests.Mode_B_reminder_dispatches_to_resolved_gateway_and_completes_on_CommandAck"/>.
 /// </summary>
+[Collection(BackgroundJobProcessCollection.Name)]
 public class BackgroundJobIntegrationTests : TestKit
 {
     private readonly DisposableTempDir _dir = new();

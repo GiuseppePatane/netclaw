@@ -128,42 +128,28 @@ public sealed class StreamingToolCallTests
     }
 
     [Fact]
-    public async Task Suspended_activity_pauses_watchdog_until_next_activity()
+    public async Task Wall_clock_budget_is_not_reset_by_activity()
     {
         var time = new FakeTimeProvider();
         var channel = Channel.CreateUnbounded<ToolCallUpdate>();
-        var activityCount = 0;
-        var firstActivitySeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var secondActivitySeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activitySeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var task = StreamingToolWatchdog.ConsumeAsync(
             channel.Reader.ReadAllAsync(TestContext.Current.CancellationToken),
-            "spawn_agent",
-            FiveSeconds,
+            "chatty_tool",
+            ToolWatchdogBudget.WallClock(TimeSpan.FromSeconds(5)),
             time,
-            onActivity: _ =>
-            {
-                if (Interlocked.Increment(ref activityCount) == 1)
-                    firstActivitySeen.TrySetResult();
-                else
-                    secondActivitySeen.TrySetResult();
-            },
+            onActivity: _ => activitySeen.TrySetResult(),
             TestContext.Current.CancellationToken);
 
-        channel.Writer.TryWrite(new ToolActivityUpdate("awaiting human approval")
-        {
-            SuspendsInactivityWatchdog = true
-        });
-        await firstActivitySeen.Task;
+        time.Advance(TimeSpan.FromSeconds(3));
+        channel.Writer.TryWrite(new ToolActivityUpdate("stdout", "."));
+        await activitySeen.Task;
 
-        time.Advance(TimeSpan.FromMinutes(5));
-        Assert.False(task.IsCompleted);
+        time.Advance(TimeSpan.FromSeconds(3));
 
-        channel.Writer.TryWrite(new ToolActivityUpdate("approval resolved"));
-        await secondActivitySeen.Task;
-        time.Advance(TimeSpan.FromSeconds(6));
-
-        await Assert.ThrowsAsync<TimeoutException>(() => task);
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => task);
+        Assert.Contains("exceeded execution budget", ex.Message);
     }
 
     [Fact]

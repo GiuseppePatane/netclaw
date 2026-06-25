@@ -19,6 +19,7 @@ using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Tools;
 using Xunit;
+using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Sessions;
 
@@ -286,7 +287,12 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
                 "shell_execute",
                 new Dictionary<string, object?>
                 {
-                    ["Command"] = "git push origin main"
+                    ["Command"] = "git push origin main",
+                    // Per-call timeout hint on the sub-agent path: the sub-agent
+                    // loop must extract this via the shared executor seam and apply
+                    // it to the tool context (it previously skipped extraction and
+                    // silently dropped the hint).
+                    ["_timeout_seconds"] = 1800
                 })
         ];
 
@@ -326,7 +332,7 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         Assert.Equal(source.Principal, request.RequesterPrincipal);
         Assert.Contains(request.Options, o => o.Key.Value == ApprovalOptionKeys.ApproveOnce);
 
-        var approvalReply = await sessionManager.Ask<ICommandReply>(new ToolInteractionResponse
+        var approvalReply = await sessionManager.Ask<ISessionResponse>(new ToolInteractionResponse
         {
             SessionId = sessionId,
             CallId = request.CallId,
@@ -348,6 +354,10 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         Assert.NotNull(_recordingShellTool);
         Assert.True(_recordingShellTool!.WasCalled);
         Assert.Equal(TrustAudience.Personal, _recordingShellTool.LastContext?.Audience);
+
+        // The sub-agent extracted the meta timeout hint and applied it to the
+        // tool context (regression guard for the previously-dropped hint).
+        Assert.Equal(1800, _recordingShellTool.LastContext?.RequestedTimeoutSeconds);
     }
 
     [Fact]
@@ -412,7 +422,7 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
         }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         await subscriberB.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
 
-        var reply = await sessionManager.Ask<ICommandReply>(new ToolInteractionResponse
+        var reply = await sessionManager.Ask<ISessionResponse>(new ToolInteractionResponse
         {
             SessionId = sessionId,
             CallId = request.CallId,
